@@ -1,0 +1,1 @@
+from pytorchwildlife.models.classification import SpeciesNetV2
