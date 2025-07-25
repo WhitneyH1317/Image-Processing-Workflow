@@ -34,7 +34,11 @@ else:
     processing_log = []
 
 # --- Determine processed folders from log ---
-processed_folders = {entry["folder"] for entry in processing_log if "folder" in entry}
+processed_folders ={
+    entry["folder"]
+    for entry in processing_log
+    if "folder" in entry and "error" not in entry
+}
 
 # --- Find all BTCF folders across all sites ---
 btcf_folders = []
@@ -49,7 +53,7 @@ for site_dir in RAW_ROOT.iterdir():
                 rel_path = subdir.relative_to(RAW_ROOT)
                 if str(rel_path) not in processed_folders:
                     btcf_folders.append(subdir)
-
+                    
 # --- Processing function ---
 def process_btcf_folder(btcf_folder):
     rel_path = btcf_folder.relative_to(RAW_ROOT)
@@ -57,6 +61,8 @@ def process_btcf_folder(btcf_folder):
     results_dir = processed_dir / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
     output_json = results_dir / "speciesnet_predictions.json"
+    boxes_dir = results_dir / "boxes"
+    boxes_dir.mkdir(exist_ok=True)
 
     cmd = [
         "python", "-m", "speciesnet.scripts.run_model",
@@ -67,6 +73,15 @@ def process_btcf_folder(btcf_folder):
     start = time.time()
     try:
         run(cmd, check=True)
+
+        vis_cmd = [
+            "python", "-m", "megadetector.visualization.visualize_detector_output",
+            str(output_json), str(boxes_dir),
+            "--confidence", "0.2",
+            "--detections_only"
+        ]
+        run(vis_cmd, check=True)
+
         duration = round(time.time() - start, 2)
         return {
             "timestamp": datetime.now().isoformat(),
@@ -80,12 +95,32 @@ def process_btcf_folder(btcf_folder):
             "error": str(e)
         }
 
-# --- Parallel processing guard ---
+# --- sequential processing ---
 if __name__ == "__main__":
-    with ProcessPoolExecutor(max_workers=6) as executor:
-        results = list(tqdm(executor.map(process_btcf_folder, btcf_folders), total=len(btcf_folders), desc="Running SpeciesNet"))
+    # Only re-run folders that are either missing or failed
+    folders_to_run = [
+        f for f in btcf_folders
+        if str(f.relative_to(RAW_ROOT)) not in processed_folders
+    ]
 
-    # --- Update log ---
+    print(f"📁 Skipping {len(btcf_folders) - len(folders_to_run)} previously successful folders.")
+    print(f"🚀 Running on {len(folders_to_run)} new or failed folders...")
+
+    results = []
+    for folder in tqdm(folders_to_run, desc="Running SpeciesNet"):
+        results.append(process_btcf_folder(folder))
+
+    # ✅ Clean the log: remove any previous entries for re-run folders
+    rerun_folder_keys = {r["folder"] for r in results}
+    processing_log = [entry for entry in processing_log if entry.get("folder") not in rerun_folder_keys]
+
+    # ✅ Add updated results
     processing_log.extend(results)
+
+    # ✅ Save log
     with open(LOG_PATH, "w") as f:
         json.dump(processing_log, f, indent=2)
+
+    print("✅ Finished processing all folders.")
+
+
