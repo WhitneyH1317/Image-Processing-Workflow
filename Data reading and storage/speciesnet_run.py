@@ -63,7 +63,7 @@ def process_btcf_folder(btcf_folder):
     output_json = results_dir / "speciesnet_predictions.json"
     boxes_dir = results_dir / "boxes"
     boxes_dir.mkdir(exist_ok=True)
-
+    
     cmd = [
         "python", "-m", "speciesnet.scripts.run_model",
         "--folders", str(btcf_folder),
