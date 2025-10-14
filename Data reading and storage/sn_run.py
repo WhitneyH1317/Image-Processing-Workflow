@@ -5,16 +5,18 @@ from pathlib import Path
 from datetime import datetime
 from subprocess import run, CalledProcessError
 from tqdm import tqdm
+# CHANGE: argparse for CLI overrides
+import argparse
 
 # =========================
-# TEST/RUN OPTIONS
+# DEFAULT OPTIONS (can be overridden via CLI)
 # =========================
-RUN_ONLY_ONE = False  # CHANGE: set True to process a single folder to sanity-check the pipeline
-ONLY_THIS_REL_PATH = None  # e.g., Path("Site01/2024-01-01/100_BTCF")
+RUN_ONLY_ONE = False
+ONLY_THIS_REL_PATH = None
 MEGADETECTOR_PY = None
-RUN_PREFIX_REL = "site02"  # e.g., "site01"
-
+RUN_PREFIX_REL = None
 ADDAX_MODE = "custom_species"
+FORCE_RERUN = False  # CHANGE: ignore skip checks if True
 
 CUSTOM_MODEL_INFO = {
     "name": "SpeciesNet Southwest",
@@ -45,6 +47,7 @@ processing_log = []
 # HELPERS
 # =========================
 def run_module(py_module: str, args: list[str]):
+    # NOTE: if you ever need MEGADETECTOR_PY, you can branch here by module name
     return run(["python", "-m", py_module, *args], check=True)
 
 # CHANGE: quick file utils for skip logic
@@ -141,7 +144,6 @@ def _normalize_rel(p: Path) -> str:
     return str(p.relative_to(RAW_ROOT)).replace("\\", "/").lower()
 
 def choose_folders_to_run(btcf_folders):
-    normed = [_normalize_rel(p) for p in btcf_folders]
     if RUN_PREFIX_REL:
         prefix = str(RUN_PREFIX_REL).replace("\\", "/").lower().strip("/")
         selected = [p for p in btcf_folders if _normalize_rel(p).startswith(prefix + "/") or _normalize_rel(p) == prefix]
@@ -154,6 +156,7 @@ def choose_folders_to_run(btcf_folders):
         return sorted(selected, key=lambda p: _normalize_rel(p))
     if RUN_ONLY_ONE:
         if ONLY_THIS_REL_PATH is None:
+            # auto-pick first
             if not btcf_folders:
                 raise RuntimeError("No BTCF folders found.")
             chosen = sorted(btcf_folders, key=lambda p: _normalize_rel(p))[0]
@@ -169,29 +172,30 @@ def choose_folders_to_run(btcf_folders):
         return [chosen]
     return btcf_folders
 
+# CHANGE: CLI overrides
+def parse_cli_overrides():
+    p = argparse.ArgumentParser(description="SpeciesNet → MD → Addax JSON pipeline")
+    p.add_argument("--run-prefix-rel", default=None,
+                   help='Relative prefix to run (e.g. "site01" or "site01/2025-04-29_2025-06-16")')
+    p.add_argument("--run-only-one", action="store_true",
+                   help="Process only the first matching BTCF folder")
+    p.add_argument("--only-this-rel-path", default=None,
+                   help='Exact relative path to a BTCF folder (e.g. "site01/2025-04-29_2025-06-16/106_BTCF")')
+    p.add_argument("--addax-mode", choices=["custom_species", "addax_species_step"],
+                   help="Keep species (custom_species) or strip so Addax does species (addax_species_step)")
+    p.add_argument("--megadetector-py", default=None,
+                   help="Full path to MD python interpreter (if you want to pin it)")
+    p.add_argument("--force-rerun", action="store_true",
+                   help="Ignore skip checks (always regenerate JSON)")
+    return p.parse_args()
+
 # =========================
 # MAIN PROCESS
 # =========================
-# Find all BTCF folders across RAW
-btcf_folders = []
-for site_dir in RAW_ROOT.iterdir():
-    if not site_dir.is_dir():
-        continue
-    for date_dir in site_dir.iterdir():
-        if not date_dir.is_dir():
-            continue
-        for subdir in date_dir.iterdir():
-            if subdir.is_dir() and "BTCF" in subdir.name:
-                btcf_folders.append(subdir)
-
-btcf_folders = sorted(btcf_folders, key=lambda p: _normalize_rel(p))
-folders_to_run = choose_folders_to_run(btcf_folders)
-print(f"🚀 Will process {len(folders_to_run)} folder(s).")
-
 def process_btcf_folder(btcf_folder: Path):
     """
     Steps:
-      0) NEW: Skip if RAW image_recognition_file.json is up-to-date and matches filenames
+      0) Skip if RAW image_recognition_file.json is up-to-date and matches filenames (unless FORCE_RERUN)
       1) Run SpeciesNet -> temp SpeciesNet JSON (in RAW BTCF)
       2) Convert to MD JSON with base_folder=RAW BTCF (relative paths)
       3) Patch to Addax schema & metadata (KEEP classifications in 'custom_species' mode)
@@ -207,11 +211,10 @@ def process_btcf_folder(btcf_folder: Path):
     processed_dir.mkdir(parents=True, exist_ok=True)
     status_path = processed_dir / "STATUS.json"
 
-    # CHANGE: Skip logic based on RAW JSON + filenames
+    # Skip logic based on RAW JSON + filenames
     skip, why, meta = should_skip_by_raw_json(raw_btc)
-    if skip:
+    if skip and not FORCE_RERUN:  # CHANGE
         print(f"⏭️  Skipping {rel_path} ({why})")
-        # still write/update STATUS so you have visibility
         status = {
             "skipped": True,
             "reason": why,
@@ -297,6 +300,7 @@ def process_btcf_folder(btcf_folder: Path):
             "raw_btc_folder": str(raw_btc),
             "addax_json_in_raw": str(addax_json),
             "mode": ADDAX_MODE,
+            "force_rerun": FORCE_RERUN,  # CHANGE
             "note": "Place postprocessing outputs (after Addax verification) in this processed folder."
         }
         with open(status_path, "w") as f:
@@ -319,8 +323,48 @@ def process_btcf_folder(btcf_folder: Path):
             json.dump(err, f, indent=2)
         return err
 
+# CHANGE: move discovery into __main__ so CLI overrides apply
 if __name__ == "__main__":
+    # Apply CLI overrides
+    args = parse_cli_overrides()
+    if args.run_prefix_rel is not None:
+        RUN_PREFIX_REL = args.run_prefix_rel
+    if args.run_only_one:
+        RUN_ONLY_ONE = True
+    if args.only_this_rel_path is not None:
+        ONLY_THIS_REL_PATH = Path(args.only_this_rel_path)
+    if args.addax_mode is not None:
+        ADDAX_MODE = args.addax_mode
+    if args.megadetector_py is not None:
+        MEGADETECTOR_PY = args.megadetector_py
+    if args.force_rerun:
+        FORCE_RERUN = True
+
+    print("CLI overrides:",
+          dict(RUN_PREFIX_REL=RUN_PREFIX_REL,
+               RUN_ONLY_ONE=RUN_ONLY_ONE,
+               ONLY_THIS_REL_PATH=str(ONLY_THIS_REL_PATH) if ONLY_THIS_REL_PATH else None,
+               ADDAX_MODE=ADDAX_MODE,
+               MEGADETECTOR_PY=MEGADETECTOR_PY,
+               FORCE_RERUN=FORCE_RERUN))
+
+    # Discover BTCF folders (after overrides)
+    btcf_folders = []
+    for site_dir in RAW_ROOT.iterdir():
+        if not site_dir.is_dir():
+            continue
+        for date_dir in site_dir.iterdir():
+            if not date_dir.is_dir():
+                continue
+            for subdir in date_dir.iterdir():
+                if subdir.is_dir() and "BTCF" in subdir.name:
+                    btcf_folders.append(subdir)
+
+    btcf_folders = sorted(btcf_folders, key=lambda p: _normalize_rel(p))
+    folders_to_run = choose_folders_to_run(btcf_folders)
     print(f"Found {len(btcf_folders)} BTCF folder(s).")
+    print(f"🚀 Will process {len(folders_to_run)} folder(s).")
+
     results = []
     for i, folder in enumerate(folders_to_run, start=1):
         results.append(process_btcf_folder(folder))
