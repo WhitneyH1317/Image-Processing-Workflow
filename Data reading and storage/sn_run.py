@@ -14,7 +14,7 @@ import argparse
 RUN_ONLY_ONE = False
 ONLY_THIS_REL_PATH = None
 MEGADETECTOR_PY = None
-RUN_PREFIX_REL = None
+RUN_SITE = None
 ADDAX_MODE = "custom_species"
 FORCE_RERUN = False  # CHANGE: ignore skip checks if True
 
@@ -144,12 +144,12 @@ def _normalize_rel(p: Path) -> str:
     return str(p.relative_to(RAW_ROOT)).replace("\\", "/").lower()
 
 def choose_folders_to_run(btcf_folders):
-    if RUN_PREFIX_REL:
-        prefix = str(RUN_PREFIX_REL).replace("\\", "/").lower().strip("/")
+    if RUN_SITE:
+        prefix = str(RUN_SITE).replace("\\", "/").lower().strip("/")
         selected = [p for p in btcf_folders if _normalize_rel(p).startswith(prefix + "/") or _normalize_rel(p) == prefix]
         if not selected:
-            raise FileNotFoundError(f"No BTCF folders found under prefix '{RUN_PREFIX_REL}'.")
-        print(f"📂 RUN_PREFIX_REL matched {len(selected)} folder(s) under '{prefix}'.")
+            raise FileNotFoundError(f"No BTCF folders found under prefix '{RUN_SITE}'.")
+        print(f"📂 RUN_SITE matched {len(selected)} folder(s) under '{prefix}'.")
         if RUN_ONLY_ONE:
             print("🛑 RUN_ONLY_ONE=True; using only the first matching folder.")
             return [sorted(selected, key=lambda p: _normalize_rel(p))[0]]
@@ -327,8 +327,8 @@ def process_btcf_folder(btcf_folder: Path):
 if __name__ == "__main__":
     # Apply CLI overrides
     args = parse_cli_overrides()
-    if args.run_prefix_rel is not None:
-        RUN_PREFIX_REL = args.run_prefix_rel
+    if args.RUN_SITE is not None:
+        RUN_SITE = args.RUN_SITE
     if args.run_only_one:
         RUN_ONLY_ONE = True
     if args.only_this_rel_path is not None:
@@ -341,7 +341,7 @@ if __name__ == "__main__":
         FORCE_RERUN = True
 
     print("CLI overrides:",
-          dict(RUN_PREFIX_REL=RUN_PREFIX_REL,
+          dict(RUN_SITE=RUN_SITE,
                RUN_ONLY_ONE=RUN_ONLY_ONE,
                ONLY_THIS_REL_PATH=str(ONLY_THIS_REL_PATH) if ONLY_THIS_REL_PATH else None,
                ADDAX_MODE=ADDAX_MODE,
