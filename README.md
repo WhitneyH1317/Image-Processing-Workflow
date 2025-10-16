@@ -14,7 +14,7 @@ The repository contains the following files and directories:
 ```
 ```
 
-# SpeciesNet Run Script (speciesnet_run.py)
+# SpeciesNet Run Script (sn_run.py)
 Overview
 
 speciesnet_run.py automates camera trap image processing for the East Foundation’s wildlife monitoring workflow using the SpeciesNet deep learning pipeline.
