@@ -60,11 +60,13 @@ Each BTCF folder is mirrored with corresponding .json results and optional annot
 
 Activate your SpeciesNet conda environment before running:
 
-conda activate speciesnet_env
+install miniforge
+
+`conda activate speciesnet_env`
 
 If MegaDetector or SpeciesNet aren’t installed, you can add them via:
 
-pip install megadetector speciesnet
+`pip install megadetector speciesnet`
 
 Make sure your Python environment includes:
 
