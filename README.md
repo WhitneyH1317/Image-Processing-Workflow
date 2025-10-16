@@ -37,7 +37,7 @@ This script is designed for large-scale, perpetual processing—safely re-runnab
 
 Expected layout for East Foundation camera-trap data:
 
-Z:\East\Camera Trap Images (raw)
+`Z:\East\Camera Trap Images (raw)
 └── site03
 ├── 2024-12-12_2025-01-31
 │ ├── 100_BTCF
@@ -46,7 +46,7 @@ Z:\East\Camera Trap Images (raw)
 │ └── 101_BTCF
 └── 2025-02-01_2025-03-31
 ├── 100_BTCF
-└── ...
+└── ...`
 
 This script was written to produce images and .json files readable by Addax AI Software, within which humans can manually verify speciesnet output. Processed results (produced by Addax AI software) are written to the parallel path:
 
