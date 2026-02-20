@@ -7,6 +7,36 @@ from subprocess import run, CalledProcessError
 from tqdm import tqdm
 # CHANGE: argparse for CLI overrides
 import argparse
+import traceback
+import random
+
+# =========================
+# FOR WEIRD NETWORK DRIVE ISSUE: TELLS SCRIPT TO WAIT AND TRY AGAIN, SKIP OVER 'MISSING' FOLDERS
+# =========================
+def safe_write_json(path: Path, payload: dict, retries: int = 5, base_sleep: float = 2.0):
+    """
+    Robust write for STATUS.json on flaky network drives.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for i in range(retries):
+        try:
+            with open(path, "w") as f:
+                json.dump(payload, f, indent=2)
+            return
+        except Exception:
+            if i == retries - 1:
+                raise
+            time.sleep(base_sleep * (i + 1))
+
+def retry_sleep(attempt: int, base: float = 15.0, jitter: float = 0.2):
+    """
+    Exponential-ish backoff with a little jitter (prevents hammering the share).
+    """
+    # attempt is 1-based
+    t = base * attempt
+    t = t * (1.0 + random.uniform(-jitter, jitter))
+    time.sleep(t)
+
 
 # =========================
 # DEFAULT OPTIONS (can be overridden via CLI)
@@ -42,6 +72,8 @@ if RAW_ROOT is None or PROCESSED_ROOT is None:
 
 LOG_PATH = PROCESSED_ROOT / "speciesnet_log.json"
 processing_log = []
+
+
 
 # =========================
 # HELPERS
@@ -189,9 +221,32 @@ def parse_cli_overrides():
                    help="Ignore skip checks (always regenerate JSON)")
     return p.parse_args()
 
+
+
 # =========================
 # MAIN PROCESS
 # =========================
+def process_btcf_folder(btcf_folder: Path):
+    import traceback
+import random
+
+def safe_write_json(path: Path, payload: dict, retries: int = 5, base_sleep: float = 2.0):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for i in range(retries):
+        try:
+            with open(path, "w") as f:
+                json.dump(payload, f, indent=2)
+            return
+        except Exception:
+            if i == retries - 1:
+                raise
+            time.sleep(base_sleep * (i + 1))
+
+def retry_sleep(attempt: int, base: float = 30.0, jitter: float = 0.2):
+    t = base * attempt
+    t = t * (1.0 + random.uniform(-jitter, jitter))
+    time.sleep(t)
+
 def process_btcf_folder(btcf_folder: Path):
     """
     Steps:
@@ -322,6 +377,49 @@ def process_btcf_folder(btcf_folder: Path):
         with open(status_path, "w") as f:
             json.dump(err, f, indent=2)
         return err
+    
+def process_btcf_folder_with_retries(btcf_folder: Path, max_attempts: int = 3):
+    rel = str(btcf_folder.relative_to(RAW_ROOT)).replace("\\", "/")
+    last_exc = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return process_btcf_folder(btcf_folder)
+
+        except Exception as e:
+            last_exc = e
+            print(f"⚠️  FAILED {rel} (attempt {attempt}/{max_attempts})")
+            print(f"    {type(e).__name__}: {e}")
+
+            # try to write status (don't let this crash)
+            try:
+                processed_dir = PROCESSED_ROOT / btcf_folder.relative_to(RAW_ROOT)
+                status_path = processed_dir / "STATUS.json"
+                safe_write_json(status_path, {
+                    "failed": True,
+                    "folder": rel,
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                    "when": datetime.now().isoformat(),
+                }, retries=3)
+            except Exception:
+                pass
+
+            if attempt < max_attempts:
+                print("    ⏳ waiting then retrying...")
+                retry_sleep(attempt, base=60.0)  # ~60s, ~120s, ~180s
+            else:
+                # give up for now; caller can revisit later
+                return {
+                    "folder": rel,
+                    "failed": True,
+                    "error_type": type(last_exc).__name__,
+                    "error": str(last_exc),
+                    "traceback": traceback.format_exc(),
+                    "timestamp": datetime.now().isoformat()
+                }    
 
 # CHANGE: move discovery into __main__ so CLI overrides apply
 if __name__ == "__main__":
@@ -365,12 +463,24 @@ if __name__ == "__main__":
     print(f"Found {len(btcf_folders)} BTCF folder(s).")
     print(f"🚀 Will process {len(folders_to_run)} folder(s).")
 
-    results = []
-    for i, folder in enumerate(folders_to_run, start=1):
-        results.append(process_btcf_folder(folder))
-        if RUN_ONLY_ONE:
-            print("🛑 RUN_ONLY_ONE=True; stopping after the first folder.")
-            break
+results = []
+failed_folders = []
+
+for i, folder in enumerate(folders_to_run, start=1):
+    res = process_btcf_folder_with_retries(folder, max_attempts=3)
+    results.append(res)
+    if isinstance(res, dict) and res.get("failed"):
+        failed_folders.append(folder)
+
+    if RUN_ONLY_ONE:
+        print("🛑 RUN_ONLY_ONE=True; stopping after the first folder.")
+        break
+
+# Optional: revisit failures once more at the end
+if failed_folders:
+    print(f"\n🔁 Re-trying {len(failed_folders)} failed folders once more at the end...\n")
+    for folder in failed_folders:
+        results.append({"revisit": True, **process_btcf_folder_with_retries(folder, max_attempts=2)})
 
     with open(LOG_PATH, "w") as f:
         json.dump(results, f, indent=2)
