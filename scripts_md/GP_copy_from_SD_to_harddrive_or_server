@@ -1,0 +1,608 @@
+"""
+================================================================================
+CAMERA TRAP SD CARD COPY SCRIPT
+================================================================================
+
+WHAT THIS SCRIPT DOES:
+  1. Scans the computer for removable drives (SD cards) plugged in.
+  2. For each SD card, figures out which camera/site it belongs to by:
+       a) PRIMARY: OCRing the first ~10 images to read a "CAMERA##" tag
+          printed on the image itself.
+       b) FALLBACK: if OCR can't find anything, reads a "siteXX" (or plain
+          "XX") folder name on the card instead.
+  3. Reads the first and last image timestamps (EXIF data) to get the date
+     range covered by that card.
+  4. Copies all .jpg images into:
+        <destination root>\\site##\\new_folder\\
+     creating the site## folder if it doesn't already exist.
+  5. Runs two duplicate checks before copying:
+       - WARNING ONLY: if an old-style date-named folder already exists in
+         that site with the exact same date range, prints a warning but
+         still copies.
+       - HARD STOP: if this exact site + exact date range has already been
+         copied before (tracked in a small manifest file), the card is
+         skipped entirely — this catches true duplicate/re-run cards.
+  6. Prints a completion message for each card (Windows drive letter +
+     site number) once its copy finishes. Any skipped card is printed at
+     the moment it's skipped, right where the skip happens — there's no
+     separate skipped-drives file or end-of-run summary list.
+
+--------------------------------------------------------------------------------
+HOW TO RUN THIS SCRIPT:
+--------------------------------------------------------------------------------
+
+  Default destination (Z:\\East\\Camera Trap Images (raw)\\):
+      python camera_trap_copy.py
+
+  Custom destination drive (mirrors the same folder structure on another
+  drive, e.g. an external hard drive plugged in as F:):
+      python camera_trap_copy.py --drive F
+      python camera_trap_copy.py -d F:
+
+  Either form of the drive letter (with or without the colon) works.
+  Just plug in your SD card(s) before running — the script auto-detects them.
+
+NOTE ON TESSERACT (OCR):
+  This script needs Tesseract OCR installed to read the "CAMERA##" text off
+  images. It auto-detects tesseract.exe (checks the system PATH first, then
+  common install locations) — no manual path editing needed on a new
+  machine. If it can't find Tesseract at all, it will print an install link
+  and exit immediately with a clear error instead of failing later.
+================================================================================
+"""
+
+import os
+import re
+import sys
+import shutil
+import string
+import ctypes
+import argparse
+import win32com.client
+from PIL import Image
+import pytesseract
+from datetime import datetime
+from multiprocessing import Pool, cpu_count, freeze_support
+from collections import Counter
+
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+
+def find_tesseract_exe():
+    """
+    Locates tesseract.exe without relying on a hardcoded, user-specific path
+    (the old hardcoded path only worked on one person's machine because it
+    included their Windows username).
+
+    Tries, in order:
+      1. Whatever's already on the system PATH (this is the normal case if
+         Tesseract was installed with the "Add to PATH" option checked).
+      2. The standard install locations the official Tesseract-OCR Windows
+         installer uses, checking both the machine-wide Program Files
+         locations and the per-user AppData location (using environment
+         variables so it works for ANY Windows username, not just one
+         specific person).
+
+    Returns the path to tesseract.exe as a string, or None if it couldn't
+    be found anywhere.
+    """
+    # 1) Already on PATH? (shutil.which mimics what the OS would find if you
+    #    typed "tesseract" at a command prompt)
+    on_path = shutil.which("tesseract")
+    if on_path:
+        return on_path
+
+    # 2) Check the standard install locations, including per-user ones built
+    #    from environment variables so this works regardless of who's
+    #    logged in / what their username is.
+    candidate_paths = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Tesseract-OCR", "tesseract.exe"),
+    ]
+    for path in candidate_paths:
+        if path and os.path.isfile(path):
+            return path
+
+    return None
+
+
+# Try to find Tesseract automatically. If we can't, fail loudly and clearly
+# right at startup (rather than letting the script run and crash later, deep
+# inside the OCR step, with a confusing error).
+_tesseract_path = find_tesseract_exe()
+if not _tesseract_path:
+    print("❌ Could not find tesseract.exe on this computer.")
+    print("   Install Tesseract OCR from: https://github.com/UB-Mannheim/tesseract/wiki")
+    print("   During installation, make sure to check the box to add it to your PATH.")
+    print("   (Alternatively, install it to the default location and re-run this script.)")
+    sys.exit(1)
+
+pytesseract.pytesseract.tesseract_cmd = _tesseract_path
+
+# Default place images get copied to if no --drive argument is given.
+DEFAULT_OUTPUT_ROOT = r"Z:\East\Camera Trap Images (raw)"
+
+# Regex used to recognize OLD-STYLE date-range folder names, e.g.:
+#   "2024-11-01_2024-11-15"
+# This is only used for the warning-only legacy-folder check, not for naming
+# any new folders (new copies always go into a folder literally named
+# "new_folder").
+DATE_FOLDER_PATTERN = re.compile(r'^(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})$')
+
+
+# ==============================================================================
+# UTILITIES
+# ==============================================================================
+
+def get_removable_drives():
+    """
+    Scans all Windows drive letters (A: through Z:) and returns the ones that
+    are removable media (SD cards, USB drives, etc.) — i.e. GetDriveTypeW
+    returns 2 (DRIVE_REMOVABLE).
+    """
+    drives = []
+    # GetLogicalDrives() returns a bitmask where each bit represents whether
+    # a drive letter (A, B, C, ...) exists on the system.
+    bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+    for i, letter in enumerate(string.ascii_uppercase):
+        if bitmask & (1 << i):
+            drive = f"{letter}:/"
+            # Only keep drives Windows classifies as "removable"
+            if ctypes.windll.kernel32.GetDriveTypeW(drive) == 2:
+                drives.append(drive)
+    return drives
+
+
+def find_dcim_folder(drive, entry_folders):
+    """
+    Looks through the top-level folders on the SD card and returns the name
+    of the one that actually holds the camera's *_BTCF image folders
+    (e.g. "100_BTCF", "101_BTCF", ...). This is usually a folder called
+    something like "DCIM100".
+
+    Returns None if no such folder is found (card might use a different
+    layout, e.g. a bare "site07" folder with BTCF folders directly inside —
+    that case is still handled fine since valid_folders[0] is used later
+    for the actual copy).
+    """
+    for f in entry_folders:
+        full = os.path.join(drive, f)
+        try:
+            # If ANY subfolder in here has "BTCF" in its name, this is our
+            # DCIM-style folder.
+            if any("BTCF" in sub for sub in os.listdir(full)):
+                return f
+        except (PermissionError, OSError):
+            # Card might have unreadable/locked folders — just skip them.
+            continue
+    return None
+
+
+def detect_camera_id_from_images(folder_100):
+    """
+    PRIMARY SITE-DETECTION METHOD.
+
+    Reads up to the first 10 .jpg images in the given BTCF folder and runs
+    OCR (via pytesseract) on each one, looking for text matching "CAMERA##"
+    (the trail camera typically stamps this onto the image itself).
+
+    Because OCR can occasionally misread one image, we collect ALL matches
+    across the sampled images and return the most COMMON one — this makes
+    the detection more robust to a single bad OCR read.
+
+    Returns None if no CAMERA## text could be found on any sampled image.
+    """
+    images = [f for f in os.listdir(folder_100) if f.lower().endswith('.jpg')][:10]
+    cam_ids = []
+    for img in images:
+        try:
+            img_path = os.path.join(folder_100, img)
+            # Convert to RGB first — some trail cam JPEGs are saved in modes
+            # pytesseract/PIL can choke on otherwise.
+            img_obj = Image.open(img_path).convert("RGB")
+            text = pytesseract.image_to_string(img_obj)
+            # Look for something like "CAMERA 07", "camera7", "Camera012" etc.
+            match = re.search(r'CAMERA\s*\d{1,3}', text, re.IGNORECASE)
+            if match:
+                # Normalize: strip spaces, lowercase -> e.g. "camera07"
+                cam_id = match.group(0).replace(" ", "").lower()
+                cam_ids.append(cam_id)
+        except Exception:
+            # If OCR/PIL fails on a given image (corrupt file, etc.), just
+            # move on to the next sample image rather than crashing.
+            continue
+    if not cam_ids:
+        return None
+    # Return whichever camera ID string appeared most often across samples
+    return Counter(cam_ids).most_common(1)[0][0]
+
+
+def detect_camera_id_from_foldername(entry_folders):
+    """
+    FALLBACK SITE-DETECTION METHOD — only used if OCR (above) couldn't find
+    a camera number on any sampled image.
+
+    Looks at the top-level folder names on the SD card for one that starts
+    with "site" (e.g. "site07") or is purely numeric (e.g. "07"), then
+    extracts the digits and builds a "camera##" ID out of them so it's
+    consistent with the OCR method's output format.
+
+    Returns None if no such folder exists on the card.
+    """
+    candidate = next((f for f in entry_folders if f.lower().startswith("site") or f.isdigit()), None)
+    if not candidate:
+        return None
+    # Strip out everything except digits, e.g. "site07" -> "07"
+    number = re.sub(r"\D", "", candidate)
+    if not number:
+        return None
+    # Pad to 2 digits so "camera7" and "camera07" don't end up as different
+    # site IDs downstream (matches the zero-padding OCR naturally produces).
+    return f"camera{number.zfill(2)}"
+
+
+def get_image_date_range(dcim_path):
+    """
+    Determines the date range covered by this SD card by reading EXIF
+    timestamps from:
+      - the FIRST image in the FIRST *_BTCF folder (chronologically first)
+      - the LAST image in the LAST *_BTCF folder (chronologically last)
+
+    Returns a (start_date, end_date) tuple of datetime objects, or
+    (None, None) if no BTCF folders / valid EXIF data could be found.
+    """
+    # Sort so btc_folders[0] is the earliest folder (e.g. "100_BTCF") and
+    # btc_folders[-1] is the latest (e.g. "105_BTCF").
+    btc_folders = sorted([f for f in os.listdir(dcim_path) if "BTCF" in f])
+    if not btc_folders:
+        return None, None
+
+    first_folder = os.path.join(dcim_path, btc_folders[0])
+    last_folder = os.path.join(dcim_path, btc_folders[-1])
+
+    def get_image_date(folder, first=True):
+        """Reads the EXIF DateTimeOriginal (or DateTime) tag off the first
+        or last image (alphabetically) in the given folder."""
+        try:
+            images = sorted([f for f in os.listdir(folder) if f.lower().endswith('.jpg')])
+            if not images:
+                return None
+            img_file = images[0] if first else images[-1]
+            img = Image.open(os.path.join(folder, img_file))
+            exif = img._getexif()
+            # EXIF tag 36867 = DateTimeOriginal, tag 306 = DateTime (fallback)
+            date_str = exif.get(36867) or exif.get(306)
+            return datetime.strptime(date_str, '%Y:%m:%d %H:%M:%S') if date_str else None
+        except Exception:
+            # Missing/corrupt EXIF data, unreadable file, etc.
+            return None
+
+    return get_image_date(first_folder, True), get_image_date(last_folder, False)
+
+
+def find_matching_date_folder(dest_root, start_date, end_date):
+    """
+    WARNING-ONLY CHECK (does NOT block the copy).
+
+    Scans the destination site folder for any OLD-STYLE folder named like
+    "YYYY-MM-DD_YYYY-MM-DD" (from before this script switched to always
+    using "new_folder"). If one of those folders' dates exactly match this
+    SD card's start/end dates, we flag it — this is useful context for
+    catching potential duplicates from before the new_folder convention.
+
+    Returns the matching folder name, or None if nothing matches.
+    """
+    if not os.path.isdir(dest_root):
+        return None
+    for name in os.listdir(dest_root):
+        full_path = os.path.join(dest_root, name)
+        if not os.path.isdir(full_path):
+            continue
+        m = DATE_FOLDER_PATTERN.match(name)
+        if not m:
+            continue
+        existing_start_str, existing_end_str = m.groups()
+        if existing_start_str == str(start_date.date()) and existing_end_str == str(end_date.date()):
+            return name
+    return None
+
+
+def has_already_been_copied(dest_root, site_folder, start_date, end_date):
+    """
+    HARD-STOP CHECK (DOES block the copy).
+
+    Every time a card is successfully copied, its date range gets appended
+    to a small manifest file at:
+        <dest_root>\\<site_folder>_copied_ranges.txt
+    as a "start_date,end_date" line.
+
+    Before copying a new card, we check this manifest — if the exact same
+    start/end date range has already been recorded for this site, it means
+    this exact card (or an identical duplicate of it) has already been
+    copied in, so we should NOT copy it again.
+
+    Returns True if a match is found (i.e. "don't copy, this is a dupe"),
+    False otherwise.
+    """
+    manifest_path = os.path.join(dest_root, f"{site_folder}_copied_ranges.txt")
+    if not os.path.exists(manifest_path):
+        # No manifest yet means nothing has ever been copied for this site.
+        return False
+    with open(manifest_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(",")
+            if len(parts) != 2:
+                continue
+            existing_start, existing_end = parts
+            if existing_start == str(start_date.date()) and existing_end == str(end_date.date()):
+                return True
+    return False
+
+
+def record_copied_range(dest_root, site_folder, start_date, end_date):
+    """
+    Appends this site's just-completed date range to its manifest file so
+    future runs can detect if the same card gets plugged in again
+    (see has_already_been_copied above).
+    """
+    manifest_path = os.path.join(dest_root, f"{site_folder}_copied_ranges.txt")
+    with open(manifest_path, "a") as f:
+        f.write(f"{start_date.date()},{end_date.date()}\n")
+
+
+# ==============================================================================
+# MAIN COPY FUNCTION
+# (runs once per SD card — called in parallel via multiprocessing.Pool)
+# ==============================================================================
+
+def copy_drive(task):
+    """
+    Does the actual file copying for a single SD card.
+
+    `task` is a tuple: (drive, cam_id, start_date, end_date, output_root)
+    — everything this function needs is passed in explicitly (rather than
+    relying on globals) because each call may run in its own separate
+    process under multiprocessing.
+    """
+    drive, cam_id, start_date, end_date, output_root = task
+
+    # --- Locate the folder on the card that actually holds the images ---
+    # (excludes the camera's "INF" settings folder, which isn't image data)
+    valid_folders = [f for f in os.listdir(drive) if os.path.isdir(os.path.join(drive, f)) and f.upper() != "INF"]
+    if not valid_folders:
+        print(f"❌ No valid folder found on {drive}. Skipping.")
+        return
+    camera_folder = os.path.join(drive, valid_folders[0])
+
+    # --- Work out where this card's images should end up ---
+    # e.g. cam_id "camera07" -> site_folder "site07"
+    site_folder = cam_id.replace("camera", "site")
+    dest_root = os.path.join(output_root, site_folder)
+    # Create the site## folder if this is the first time we've seen this site
+    os.makedirs(dest_root, exist_ok=True)
+
+    # --- DUPLICATE CHECK #1: HARD STOP -------------------------------------
+    # If we've already fully copied this exact site + exact date range
+    # before, this card is treated as an identical duplicate and skipped
+    # entirely (should basically never happen under normal use).
+    if has_already_been_copied(dest_root, site_folder, start_date, end_date):
+        print(f"❌ Identical site found — {site_folder} already has an exact copy of "
+              f"{start_date.date()} to {end_date.date()}. Skipping drive {drive}.")
+        return
+
+    # --- DUPLICATE CHECK #2: WARNING ONLY -----------------------------------
+    # Checks for an OLD-STYLE dated folder with the same date range. This
+    # does NOT stop the copy — it's just a heads-up for the user to
+    # double-check nothing's being duplicated from before "new_folder" was
+    # the standard destination name.
+    legacy_match = find_matching_date_folder(dest_root, start_date, end_date)
+    if legacy_match:
+        print(f"⚠️ Check {site_folder} - dates already exist in an existing folder.")
+
+    # --- Set up the destination folder --------------------------------------
+    # All new copies always go into a folder literally named "new_folder"
+    # inside the site folder — no date-based naming anymore.
+    full_dest = os.path.join(dest_root, "new_folder")
+    existing = os.path.exists(full_dest)
+    if existing:
+        # If new_folder already exists (e.g. script was interrupted last
+        # time, or another card for this site was copied earlier), we merge
+        # into it rather than overwriting/erroring.
+        print(f"♻️ 'new_folder' already exists in {site_folder} — resuming/merging copy.")
+    else:
+        print(f"♻️ Starting new copy to: {full_dest}")
+
+    os.makedirs(full_dest, exist_ok=True)
+
+    # Running counters + list of any failure messages for this card
+    copied = verified = failed = 0
+    failures = []
+
+    # --- Walk through every *_BTCF folder and copy its .jpg files ----------
+    dcim_path = camera_folder
+    for btc_folder in os.listdir(dcim_path):
+        if "BTCF" not in btc_folder:
+            # Skip anything that isn't an image folder (e.g. stray files)
+            continue
+        src_folder = os.path.join(dcim_path, btc_folder)
+        if not os.path.isdir(src_folder):
+            continue
+
+        # os.walk in case BTCF folders ever contain their own subfolders
+        for root, _, files in os.walk(src_folder):
+            # Mirror the same relative folder structure in the destination
+            rel_subfolder = os.path.relpath(root, dcim_path)
+            dst_subfolder = os.path.join(full_dest, rel_subfolder)
+            os.makedirs(dst_subfolder, exist_ok=True)
+
+            for file in files:
+                if not file.lower().endswith('.jpg'):
+                    # Only copying images — ignore any other file types
+                    continue
+                src_file = os.path.join(root, file)
+                dst_file = os.path.join(dst_subfolder, file)
+
+                # --- Skip-if-already-copied check (per file) ---
+                # Lets the script resume a previously interrupted copy
+                # without re-copying files that are already fully there.
+                if os.path.exists(dst_file):
+                    src_size = os.path.getsize(src_file)
+                    dst_size = os.path.getsize(dst_file)
+                    if dst_size >= src_size:
+                        continue  # already copied (same size or bigger), skip
+
+                try:
+                    # copy2 preserves metadata (timestamps etc.) along with
+                    # the file contents
+                    shutil.copy2(src_file, dst_file)
+                    copied += 1
+                    # Quick verification: does the copied file's size match
+                    # the source file's size?
+                    if os.path.getsize(src_file) == os.path.getsize(dst_file):
+                        verified += 1
+                    else:
+                        failures.append(f"❌ Size mismatch: {dst_file}")
+                        failed += 1
+                except Exception as e:
+                    failures.append(f"❌ Failed to copy {src_file}: {e}")
+                    failed += 1
+
+    print(f"✅ {site_folder}/new_folder: {copied} copied, {verified} verified, {failed} failed.")
+
+    # If anything went wrong, write it out to a persistent log file next to
+    # the site folder so it's not lost once the console closes.
+    if failures:
+        log_path = os.path.join(dest_root, f"{site_folder}_copy_log.txt")
+        with open(log_path, "a") as log:
+            log.write(f"\n--- Copy run {datetime.now()} ---\n")
+            for line in failures:
+                log.write(line + "\n")
+
+    # Record this date range as done so future runs can detect if this same
+    # card (or an identical duplicate) ever gets plugged in again.
+    record_copied_range(dest_root, site_folder, start_date, end_date)
+
+    # Let the user know this card is fully done — includes both the Windows
+    # drive letter (so they know which physical card/reader slot) and the
+    # site number (so they know which camera it was), since drive letters
+    # don't tell you which camera the card came from at a glance.
+    print(f"🏁 Completed: drive {drive} -> {site_folder}")
+
+
+# ==============================================================================
+# MAIN SCRIPT ENTRY POINT
+# ==============================================================================
+if __name__ == '__main__':
+    # Required on Windows when using multiprocessing from a script that
+    # might get frozen into an .exe (e.g. via PyInstaller).
+    freeze_support()
+
+    # --- Parse command-line arguments ---------------------------------------
+    parser = argparse.ArgumentParser(description="Copy camera trap images from SD cards.")
+    parser.add_argument(
+        "-d", "--drive",
+        type=str,
+        default=None,
+        help=(
+            "Destination drive letter (e.g. 'F' or 'F:'). If omitted, defaults to "
+            r"Z:\East\Camera Trap Images (raw)\ . If provided, the script mirrors the same "
+            r"folder structure on that drive, e.g. F:\East\Camera Trap Images (raw)\ "
+        )
+    )
+    args = parser.parse_args()
+
+    # --- Resolve the destination root based on the --drive argument --------
+    if args.drive:
+        # Strip off any trailing colon/slashes the user might have typed
+        # (e.g. "F:", "F:/", "F" all become just "F")
+        drive_letter = args.drive.rstrip(":/\\").upper()
+        # Mirror the SAME folder structure on the chosen drive
+        output_root = os.path.join(f"{drive_letter}:\\", "East", "Camera Trap Images (raw)")
+    else:
+        # No --drive given -> use the default Z: destination
+        output_root = DEFAULT_OUTPUT_ROOT
+
+    print(f"✅ Script started successfully — destination root: {output_root}")
+
+    # Maps drive -> (cam_id, start_date, end_date) for every card we
+    # successfully identified below, so we can hand them off to the
+    # multiprocessing pool afterward.
+    drive_cam_map = {}
+
+    # --- STEP 1: scan every removable drive and figure out what's on it ----
+    for drive in get_removable_drives():
+        print(f"\n📁 Scanning drive: {drive}")
+        try:
+            # Every top-level folder on the card except the camera's "INF"
+            # settings folder
+            entry_folders = [f for f in os.listdir(drive) if os.path.isdir(os.path.join(drive, f)) and f.upper() != "INF"]
+        except (PermissionError, OSError):
+            # Drive letter exists but isn't actually ready/readable yet
+            # (e.g. card reader slot is empty, or card still initializing)
+            print(f"⚠️ Drive {drive} is not ready. Skipping.")
+            continue
+
+        if not entry_folders:
+            print(f"⚠️ No folders found on {drive}, skipping.")
+            continue
+
+        # Find the folder that holds the *_BTCF image subfolders
+        dcim_folder = find_dcim_folder(drive, entry_folders)
+        cam_id = None
+
+        # --- 1) PRIMARY: try OCR on the image strip -------------------------
+        if dcim_folder:
+            btc_subfolders = sorted([f for f in os.listdir(os.path.join(drive, dcim_folder)) if "BTCF" in f])
+            if btc_subfolders:
+                # Use the first BTCF folder as our OCR sample source
+                folder_100 = os.path.join(drive, dcim_folder, btc_subfolders[0])
+                cam_id = detect_camera_id_from_images(folder_100)
+                if cam_id:
+                    print(f"✔ Detected camera ID from image strip (OCR): {cam_id}")
+
+        # --- 2) FALLBACK: read a siteXX / XX folder name on the card -------
+        # Only runs if OCR above didn't find anything.
+        if not cam_id:
+            cam_id = detect_camera_id_from_foldername(entry_folders)
+            if cam_id:
+                print(f"✔ OCR failed — used folder name instead -> camera ID: {cam_id}")
+
+        # --- Neither method worked -> can't process this card --------------
+        if not cam_id:
+            print(f"❌ Could not determine camera/site ID on {drive} (OCR failed, no site folder found), skipping.")
+            continue
+
+        # We have a cam_id, but we still need a valid image folder to read
+        # dates from and copy later
+        if not dcim_folder:
+            print(f"⚠️ No folder with BTCF subfolders found on {drive}, skipping.")
+            continue
+
+        # --- Read the date range covered by this card -----------------------
+        start_date, end_date = get_image_date_range(os.path.join(drive, dcim_folder))
+        if not start_date or not end_date:
+            print(f"❌ Could not read image dates on {drive}, skipping.")
+            continue
+
+        # This card is good to go — remember it for the copy phase below
+        drive_cam_map[drive] = (cam_id, start_date, end_date)
+
+    # --- STEP 2: copy all identified cards in parallel ----------------------
+    # Bundle output_root into each task tuple so every worker process has
+    # everything it needs without relying on shared/global state.
+    tasks = [(d, cam_id, s, e, output_root) for d, (cam_id, s, e) in drive_cam_map.items()]
+    if tasks:
+        print("\n🚀 Starting parallel copy operations...")
+        # Don't spin up more worker processes than we have cards to copy,
+        # and never more than the machine's CPU count.
+        with Pool(min(len(tasks), cpu_count())) as pool:
+            pool.map(copy_drive, tasks)
+    else:
+        print("❌ No drives to process.")
+
+    print("\n🎉 All tasks completed.")
